@@ -15,7 +15,7 @@ import moment from 'moment-timezone';
 import {GENERIC_ERROR_MESSAGE} from '../services/notifications';
 import {action, computed} from '@ember/object';
 import {alias, mapBy} from '@ember/object/computed';
-import {capitalize} from '@ember/string';
+import {capitalizeFirstLetter} from '../helpers/capitalize-first-letter';
 import {captureMessage} from '@sentry/ember';
 import {dropTask, enqueueTask, restartableTask, task, taskGroup, timeout} from 'ember-concurrency';
 import {htmlSafe} from '@ember/template';
@@ -26,6 +26,7 @@ import {isHostLimitError, isServerUnreachableError, isVersionMismatchError} from
 import {isInvalidError} from 'ember-ajax/errors';
 import {mobiledocToLexical} from '@tryghost/kg-converters';
 import {inject as service} from '@ember/service';
+import {tracked} from '@glimmer/tracking';
 
 const DEFAULT_TITLE = '(Untitled)';
 // suffix that is applied to the title of a post when it has been duplicated
@@ -102,6 +103,45 @@ const messageMap = {
     }
 };
 
+function textHasTk(text) {
+    let matchArr = TK_REGEX.exec(text);
+
+    if (matchArr === null) {
+        return false;
+    }
+
+    function isValidMatch(match) {
+        // negative lookbehind isn't supported before Safari 16.4
+        // so we capture the preceding char and test it here
+        if (match[1] && match[1].trim() && WORD_CHAR_REGEX.test(match[1])) {
+            return false;
+        }
+
+        // we also check any following char in code to avoid an overly
+        // complex regex when looking for word-chars following the optional
+        // trailing symbol char
+        if (match[4] && match[4].trim() && WORD_CHAR_REGEX.test(match[4])) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // our regex will match invalid TKs because we can't use negative lookbehind
+    // so we need to loop through the matches discarding any that are invalid
+    // and moving on to any subsequent matches
+    while (matchArr !== null && !isValidMatch(matchArr)) {
+        text = text.slice(matchArr.index + matchArr[0].length - 1);
+        matchArr = TK_REGEX.exec(text);
+    }
+
+    if (matchArr === null) {
+        return false;
+    }
+
+    return true;
+}
+
 @classic
 export default class LexicalEditorController extends Controller {
     @controller application;
@@ -112,11 +152,14 @@ export default class LexicalEditorController extends Controller {
     @service notifications;
     @service router;
     @service slugGenerator;
+    @service search;
     @service session;
     @service settings;
     @service ui;
 
     @inject config;
+
+    @tracked excerptErrorMessage = '';
 
     /* public properties -----------------------------------------------------*/
 
@@ -224,48 +267,23 @@ export default class LexicalEditorController extends Controller {
 
     @computed('post.titleScratch')
     get titleHasTk() {
-        let text = this.post.titleScratch;
-        let matchArr = TK_REGEX.exec(text);
-
-        if (matchArr === null) {
-            return false;
-        }
-
-        function isValidMatch(match) {
-            // negative lookbehind isn't supported before Safari 16.4
-            // so we capture the preceding char and test it here
-            if (match[1] && match[1].trim() && WORD_CHAR_REGEX.test(match[1])) {
-                return false;
-            }
-
-            // we also check any following char in code to avoid an overly
-            // complex regex when looking for word-chars following the optional
-            // trailing symbol char
-            if (match[4] && match[4].trim() && WORD_CHAR_REGEX.test(match[4])) {
-                return false;
-            }
-
-            return true;
-        }
-
-        // our regex will match invalid TKs because we can't use negative lookbehind
-        // so we need to loop through the matches discarding any that are invalid
-        // and moving on to any subsequent matches
-        while (matchArr !== null && !isValidMatch(matchArr)) {
-            text = text.slice(matchArr.index + matchArr[0].length - 1);
-            matchArr = TK_REGEX.exec(text);
-        }
-
-        if (matchArr === null) {
-            return false;
-        }
-
-        return true;
+        return textHasTk(this.post.titleScratch);
     }
 
-    @computed('titleHasTk', 'postTkCount', 'featureImageTkCount')
+    @computed('post.customExcerpt')
+    get excerptHasTk() {
+        if (!this.feature.editorExcerpt) {
+            return false;
+        }
+
+        return textHasTk(this.post.customExcerpt || '');
+    }
+
+    @computed('titleHasTk', 'excerptHasTk', 'postTkCount', 'featureImageTkCount')
     get tkCount() {
-        return (this.titleHasTk ? 1 : 0) + this.postTkCount + this.featureImageTkCount;
+        const titleTk = this.titleHasTk ? 1 : 0;
+        const excerptTk = (this.feature.editorExcerpt && this.excerptHasTk) ? 1 : 0;
+        return titleTk + excerptTk + this.postTkCount + this.featureImageTkCount;
     }
 
     @action
@@ -281,6 +299,22 @@ export default class LexicalEditorController extends Controller {
     @action
     updateTitleScratch(title) {
         this.set('post.titleScratch', title);
+    }
+
+    @action
+    async updateExcerpt(excerpt) {
+        this.post.customExcerpt = excerpt;
+        try {
+            await this.post.validate({property: 'customExcerpt'});
+            this.excerptErrorMessage = '';
+        } catch (e) {
+            // validator throws undefined on validation error
+            if (e === undefined) {
+                this.excerptErrorMessage = this.post.errors.errorsFor('customExcerpt')?.[0]?.message;
+                return;
+            }
+            throw e;
+        }
     }
 
     // updates local willPublish/Schedule values, does not get applied to
@@ -887,9 +921,12 @@ export default class LexicalEditorController extends Controller {
     @restartableTask
     *backgroundLoaderTask() {
         yield this.store.query('snippet', {limit: 'all'});
+
         if (this.post.displayName === 'page' && this.feature.get('collections') && this.feature.get('collectionsCard')) {
             yield this.store.query('collection', {limit: 'all'});
         }
+
+        this.search.refreshContentTask.perform();
         this.syncMobiledocSnippets();
     }
 
@@ -1260,12 +1297,14 @@ export default class LexicalEditorController extends Controller {
         let notifications = this.notifications;
         let message = messageMap.success.post[prevStatus][status];
         let actions, type, path;
+        type = this.get('post.displayName');
 
         if (status === 'published' || status === 'scheduled') {
-            type = capitalize(this.get('post.displayName'));
             path = this.get('post.url');
-            actions = `<a href="${path}" target="_blank">View ${type}</a>`;
+            actions = `<a href="${path}" target="_blank">View on site</a>`;
         }
+
+        message = capitalizeFirstLetter(type) + ' ' + message.toLowerCase();
 
         notifications.showNotification(message, {type: 'success', actions: (actions && htmlSafe(actions)), delayed});
     }
@@ -1275,11 +1314,12 @@ export default class LexicalEditorController extends Controller {
             publishedAtUTC,
             previewUrl,
             emailOnly,
-            newsletter
+            newsletter,
+            displayName
         } = this.post;
         let publishedAtBlogTZ = moment.tz(publishedAtUTC, this.settings.timezone);
 
-        let title = 'Scheduled';
+        let title = capitalizeFirstLetter(displayName) + ' scheduled';
         let description = emailOnly ? ['Will be sent'] : ['Will be published'];
 
         if (newsletter) {
@@ -1287,17 +1327,18 @@ export default class LexicalEditorController extends Controller {
             description.push(`${!emailOnly ? 'and delivered ' : ''}to <span><strong>${recipientCount}</strong></span>`);
         }
 
-        description.push(`on <span><strong>${publishedAtBlogTZ.format('MMM Do')}</strong></span>`);
-        description.push(`at <span><strong>${publishedAtBlogTZ.format('HH:mm')}</strong>`);
+        description.push(`on <span><strong>${publishedAtBlogTZ.format('D MMM YYYY')}</strong></span>`);
+        let timeZoneLabel = '';
         if (publishedAtBlogTZ.utcOffset() === 0) {
-            description.push('(UTC)</span>');
+            timeZoneLabel = '(UTC)</span>';
         } else {
-            description.push(`(UTC${publishedAtBlogTZ.format('Z').replace(/([+-])0/, '$1').replace(/:00/, '')})</span>`);
+            timeZoneLabel = `(UTC${publishedAtBlogTZ.format('Z').replace(/([+-])0/, '$1').replace(/:00/, '')})</span>`;
         }
+        description.push(`at <span><strong>${publishedAtBlogTZ.format('HH:mm')}</strong>&nbsp;${timeZoneLabel}`);
 
         description = htmlSafe(description.join(' '));
 
-        let actions = htmlSafe(`<a href="${previewUrl}" target="_blank">View Preview</a>`);
+        let actions = htmlSafe(`<a href="${previewUrl}" target="_blank">Show preview</a>`);
 
         return this.notifications.showNotification(title, {description, actions, type: 'success', delayed});
     }

@@ -25,7 +25,8 @@ const GA_FEATURES = [
     'filterEmailDisabled',
     'newEmailAddresses',
     'portalImprovements',
-    'onboardingChecklist'
+    'onboardingChecklist',
+    'newsletterExcerpt'
 ];
 
 // NOTE: this allowlist is meant to be used to filter out any unexpected
@@ -36,7 +37,8 @@ const BETA_FEATURES = [
     'activitypub',
     'internalLinking',
     'stripeAutomaticTax',
-    'webmentions'
+    'webmentions',
+    'editorExcerpt'
 ];
 
 const ALPHA_FEATURES = [
@@ -51,9 +53,8 @@ const ALPHA_FEATURES = [
     'tipsAndDonations',
     'importMemberTier',
     'lexicalIndicators',
-    // 'adminXOffers',
     'adminXDemo',
-    'membersSpamPrevention'
+    'internalLinkingAtLinks'
 ];
 
 module.exports.GA_KEYS = [...GA_FEATURES];
@@ -80,6 +81,10 @@ module.exports.getAll = () => {
     labs.members = settingsCache.get('members_signup_access') !== 'none';
 
     return labs;
+};
+
+module.exports.getAllFlags = function () {
+    return [...GA_FEATURES, ...BETA_FEATURES, ...ALPHA_FEATURES];
 };
 
 /**
@@ -140,7 +145,7 @@ module.exports.enabledHelper = function enabledHelper(options, callback) {
     return errString;
 };
 
-module.exports.enabledMiddleware = flag => (req, res, next) => {
+module.exports.enabledMiddleware = flag => function labsEnabledMw(req, res, next) {
     if (module.exports.isSet(flag) === true) {
         return next();
     } else {
